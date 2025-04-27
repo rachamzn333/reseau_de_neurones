@@ -1,0 +1,21 @@
+﻿  cnn.cpp
+  layers.cpp
+C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Tools\MSVC\14.29.30133\include\xutility(4484,24): warning C4244: '=': conversion from 'const _Ty' to 'float', possible loss of data
+          with
+          [
+              _Ty=int
+          ]
+D:\mnist-2\mnist\mnist\layers.cpp(40): message : see reference to function template instantiation 'void std::fill<std::_Vector_iterator<std::_Vector_val<std::_Simple_types<_Ty>>>,int>(const _FwdIt,const _FwdIt,const int &)' being compiled
+          with
+          [
+              _Ty=float,
+              _FwdIt=std::_Vector_iterator<std::_Vector_val<std::_Simple_types<float>>>
+          ]
+  main.cpp
+  mnist_loader.cpp
+  training.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 508 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  mnist.vcxproj -> D:\mnist-2\mnist\x64\Release\mnist.exe
