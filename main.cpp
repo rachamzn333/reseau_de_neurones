@@ -11,6 +11,8 @@ constexpr const char* TEST_LABELS = "D:\\mnist\\t10k-labels.idx1-ubyte";
 
 constexpr int   EPOCHS = 3;
 constexpr float LR = 0.01f;
+constexpr int    BATCH_SIZE = 32;   // taille du mini-lot
+
 
 int main() {
     try {
@@ -21,7 +23,8 @@ int main() {
 
         std::mt19937 gen(42);
         CNN net(LR, gen);
-        train_epoch_loop(net, Xtr, Ytr, Xte, Yte, EPOCHS);
+      train_epoch_loop(net, Xtr, Ytr, Xte, Yte, EPOCHS, BATCH_SIZE);
+
     }
     catch (const std::exception& ex) {
         std::cerr << "ERROR: " << ex.what() << "\n";
