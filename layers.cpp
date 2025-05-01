@@ -52,36 +52,63 @@ Tensor ConvLayer::forward(const Tensor& in)
     return out;
 }
 
-/* ---------- backward (toujours séquentiel) ---------- */
-Tensor ConvLayer::backward(const Tensor& g)            /* PARALLEL_CANDIDATE_OpenMP */
+/* ---------- backward (parallélisé, approche simple) ---------- */
+Tensor ConvLayer::backward(const Tensor& g)            
 {
     const int H = IMG_SIZE;
+
+    /* on réinitialise les cumuls globaux */
     std::fill(dW_.begin(), dW_.end(), 0.f);
     std::fill(db_.begin(), db_.end(), 0.f);
     Tensor dx(cache_.size(), 0.f);
 
-    for (int oc = 0; oc < outC_; ++oc) {               /* PARALLEL_CANDIDATE_OpenMP */
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < H; ++x) {
-                float grad = g[idx(oc, y, x, outC_, H, H)];
-                db_[oc] += grad;
-                for (int ic = 0; ic < inC_; ++ic)
-                    for (int ky = -1; ky <= 1; ++ky)
-                        for (int kx = -1; kx <= 1; ++kx) {
-                            int iy = y + ky, ix = x + kx;
-                            if (iy < 0 || iy >= H || ix < 0 || ix >= H) continue;
-                            int wi = (((oc * inC_ + ic) * k_ + (ky + 1)) * k_ + (kx + 1));
-                            dW_[wi] += cache_[idx(ic, iy, ix, inC_, H, H)] * grad;
-                            dx[idx(ic, iy, ix, inC_, H, H)] += W_[wi] * grad;
-                        }
-            }
-    }
+#pragma omp parallel
+    {
+        /* ---------- buffers privés au thread ---------- */
+        std::vector<float> dW_local(dW_.size(), 0.f);
+        std::vector<float> db_local(db_.size(), 0.f);
+        Tensor            dx_local(cache_.size(), 0.f);
+
+        /* ---------- boucle principale partagée ---------- */
+#pragma omp for schedule(static)
+        for (int oc = 0; oc < outC_; ++oc) {
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < H; ++x) {
+                    float grad = g[idx(oc, y, x, outC_, H, H)];
+                    db_local[oc] += grad;
+
+                    for (int ic = 0; ic < inC_; ++ic)
+                        for (int ky = -1; ky <= 1; ++ky)
+                            for (int kx = -1; kx <= 1; ++kx) {
+                                int iy = y + ky, ix = x + kx;
+                                if (iy < 0 || iy >= H || ix < 0 || ix >= H) continue;
+
+                                int wi = (((oc * inC_ + ic) * k_ + (ky + 1)) * k_ + (kx + 1));
+
+                                dW_local[wi] += cache_[idx(ic, iy, ix, inC_, H, H)] * grad;
+                                dx_local[idx(ic, iy, ix, inC_, H, H)] += W_[wi] * grad;
+                            }
+                }
+        }
+
+        /* ---------- fusion des résultats ---------- */
+#pragma omp critical
+        {
+            for (std::size_t i = 0; i < dW_.size(); ++i) dW_[i] += dW_local[i];
+            for (std::size_t i = 0; i < db_.size(); ++i) db_[i] += db_local[i];
+            for (std::size_t i = 0; i < dx.size(); ++i) dx[i] += dx_local[i];
+        }
+    } // fin de la région parallel
+
+    /* cumul pour le mini-lot */
     std::transform(gW_.begin(), gW_.end(), dW_.begin(),
                    gW_.begin(), std::plus<float>());
     std::transform(gb_.begin(), gb_.end(), db_.begin(),
                    gb_.begin(), std::plus<float>());
+
     return dx;
 }
+
 
 void ConvLayer::apply_gradients(int batch_sz, float lr)
 {
@@ -162,13 +189,21 @@ Tensor MaxPool::forward(const Tensor& in)
 }
 
 
-Tensor MaxPool::backward(const Tensor& g)              /* PARALLEL_CANDIDATE_OpenMP */
+Tensor MaxPool::backward(const Tensor& g)
 {
     Tensor dx(C_ * IMG_SIZE * IMG_SIZE, 0.f);
+
+    /*  Chaque élément de g correspond à un indice UNIQUE dans argmax_
+        (les fenêtres 2×2 ne se chevauchent pas).  Les écritures dans dx
+        sont donc distinctes : on peut paralléliser la boucle sans
+        mécanisme de synchronisation. */
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < argmax_.size(); ++i)
         dx[argmax_[i]] = g[i];
+
     return dx;
 }
+
 
 /* ───────── Dense ───────────────────────────────────────────── */
 Dense::Dense(int inD, int outD, std::mt19937& g)
@@ -199,26 +234,50 @@ Tensor Dense::forward(const Tensor& in)
     return y;
 }
 
-/* ---------- backward (séquentiel) ---------- */
-Tensor Dense::backward(const Tensor& g)                /* PARALLEL_CANDIDATE_OpenMP */
+/* ---------- backward (parallélisé) ---------- */
+Tensor Dense::backward(const Tensor& g)
 {
+    /* réinitialise les cumuls globaux */
     std::fill(dW_.begin(), dW_.end(), 0.f);
     std::fill(db_.begin(), db_.end(), 0.f);
     Tensor dx(inD_, 0.f);
 
-    for (int o = 0; o < outD_; ++o) {                   /* PARALLEL_CANDIDATE_OpenMP */
-        db_[o] += g[o];
-        for (int i = 0; i < inD_; ++i) {
-            dW_[o * inD_ + i] += cache_[i] * g[o];
-            dx[i] += W_[o * inD_ + i] * g[o];
+#pragma omp parallel
+    {
+        /* --- buffers privés à chaque thread --- */
+        std::vector<float> dW_local(dW_.size(), 0.f);
+        std::vector<float> db_local(db_.size(), 0.f);
+        Tensor            dx_local(inD_, 0.f);
+
+        /* --- boucle principale partagée --- */
+#pragma omp for schedule(static)
+        for (int o = 0; o < outD_; ++o) {
+            db_local[o] += g[o];
+
+            for (int i = 0; i < inD_; ++i) {
+                dW_local[o * inD_ + i] += cache_[i] * g[o];
+                dx_local[i]            += W_[o * inD_ + i] * g[o];
+            }
         }
-    }
+
+        /* --- fusion dans les buffers globaux --- */
+#pragma omp critical
+        {
+            for (std::size_t k = 0; k < dW_.size(); ++k) dW_[k] += dW_local[k];
+            for (std::size_t k = 0; k < db_.size(); ++k) db_[k] += db_local[k];
+            for (std::size_t k = 0; k < dx.size();  ++k) dx[k]  += dx_local[k];
+        }
+    } // fin région parallel
+
+    /* cumul vers le mini-lot */
     std::transform(gW_.begin(), gW_.end(), dW_.begin(),
                    gW_.begin(), std::plus<float>());
     std::transform(gb_.begin(), gb_.end(), db_.begin(),
                    gb_.begin(), std::plus<float>());
+
     return dx;
 }
+
 
 void Dense::apply_gradients(int batch_sz, float lr)
 {
