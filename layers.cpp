@@ -3,29 +3,38 @@
 #include <cmath>
 #include <numeric>
 
+#ifdef _OPENMP          // ajout : en-tête OpenMP
+  #include <omp.h>
+#endif
+
 /* ───────── ConvLayer ─────────────────────────────────────────── */
 ConvLayer::ConvLayer(int inC, int outC, int k, std::mt19937& g)
     : inC_(inC), outC_(outC), k_(k)
 {
     std::uniform_real_distribution<float> D(-0.05f, 0.05f);
-    W_.resize(outC_ * inC_ * k_ * k_);  b_.resize(outC_);
+    W_.resize(outC_ * inC_ * k_ * k_);
+    b_.resize(outC_);
     for (float& w : W_) w = D(g);
 
     dW_.resize(W_.size()); db_.resize(b_.size());
     gW_.assign(W_.size(), 0.f); gb_.assign(b_.size(), 0.f);
 }
 
-int ConvLayer::idx(int c, int y, int x, int C, int H, int W) const {
+int ConvLayer::idx(int c, int y, int x, int C, int H, int W) const
+{
     return c * H * W + y * W + x;
 }
 
-Tensor ConvLayer::forward(const Tensor& in) {
+/* ---------- forward (parallélisé) ---------- */
+Tensor ConvLayer::forward(const Tensor& in)
+{
     cache_ = in;
     const int H = IMG_SIZE;
     Tensor out(outC_ * H * H);
 
-    for (int oc = 0; oc < outC_; ++oc) {                 /* PARALLEL_CANDIDATE_OpenMP */
-        for (int y = 0; y < H; ++y)
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int oc = 0; oc < outC_; ++oc) {
+        for (int y = 0; y < H; ++y) {
             for (int x = 0; x < H; ++x) {
                 float sum = b_[oc];
                 for (int ic = 0; ic < inC_; ++ic)
@@ -38,17 +47,20 @@ Tensor ConvLayer::forward(const Tensor& in) {
                         }
                 out[idx(oc, y, x, outC_, H, H)] = sum;
             }
+        }
     }
     return out;
 }
 
-Tensor ConvLayer::backward(const Tensor& g) {           // ← plus de lr
+/* ---------- backward (toujours séquentiel) ---------- */
+Tensor ConvLayer::backward(const Tensor& g)            /* PARALLEL_CANDIDATE_OpenMP */
+{
     const int H = IMG_SIZE;
     std::fill(dW_.begin(), dW_.end(), 0.f);
     std::fill(db_.begin(), db_.end(), 0.f);
     Tensor dx(cache_.size(), 0.f);
 
-    for (int oc = 0; oc < outC_; ++oc) {                 /* PARALLEL_CANDIDATE_OpenMP */
+    for (int oc = 0; oc < outC_; ++oc) {               /* PARALLEL_CANDIDATE_OpenMP */
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < H; ++x) {
                 float grad = g[idx(oc, y, x, outC_, H, H)];
@@ -64,9 +76,10 @@ Tensor ConvLayer::backward(const Tensor& g) {           // ← plus de lr
                         }
             }
     }
-    /* cumul pour le mini-lot */
-    std::transform(gW_.begin(), gW_.end(), dW_.begin(), gW_.begin(), std::plus<float>());
-    std::transform(gb_.begin(), gb_.end(), db_.begin(), gb_.begin(), std::plus<float>());
+    std::transform(gW_.begin(), gW_.end(), dW_.begin(),
+                   gW_.begin(), std::plus<float>());
+    std::transform(gb_.begin(), gb_.end(), db_.begin(),
+                   gb_.begin(), std::plus<float>());
     return dx;
 }
 
@@ -84,49 +97,76 @@ void ConvLayer::apply_gradients(int batch_sz, float lr)
 }
 
 /* ───────── ReLU ─────────────────────────────────────────────── */
-Tensor ReLU::forward(const Tensor& in) {
+Tensor ReLU::forward(const Tensor& in)
+{
     cache_ = in;
     Tensor y(in.size());
-    for (size_t i = 0; i < in.size(); ++i) y[i] = in[i] > 0 ? in[i] : 0;
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t i = 0; i < in.size(); ++i)
+        y[i] = in[i] > 0.f ? in[i] : 0.f;
+
     return y;
 }
 
-Tensor ReLU::backward(const Tensor& g) {
+Tensor ReLU::backward(const Tensor& g)                 /* PARALLEL_CANDIDATE_OpenMP */
+{
     Tensor dx(g.size());
-    for (size_t i = 0; i < g.size(); ++i) dx[i] = cache_[i] > 0 ? g[i] : 0;
+    for (std::size_t i = 0; i < g.size(); ++i)
+        dx[i] = cache_[i] > 0.f ? g[i] : 0.f;
     return dx;
 }
 
 /* ───────── MaxPool ─────────────────────────────────────────── */
-int MaxPool::idx(int c, int y, int x, int C, int H, int W) const {
+int MaxPool::idx(int c, int y, int x, int C, int H, int W) const
+{
     return c * H * W + y * W + x;
 }
 
-Tensor MaxPool::forward(const Tensor& in) {
+Tensor MaxPool::forward(const Tensor& in)
+{
     C_ = static_cast<int>(in.size()) / (IMG_SIZE * IMG_SIZE);
-    H_ = IMG_SIZE / 2; W_ = H_;
-    Tensor out(C_ * H_ * W_);
-    argmax_.clear(); argmax_.reserve(out.size());
+    H_ = IMG_SIZE / 2;
+    W_ = H_;
 
-    for (int c = 0; c < C_; ++c)                              /* PARALLEL_CANDIDATE_OpenMP */
+    Tensor out(C_ * H_ * W_);
+
+    /* --- on pré-alloue argmax_ pour éviter les push_back concurrents --- */
+    argmax_.assign(out.size(), 0);
+
+    /* Chaque couple (c, y, x) est indépendant ; on peut donc
+       paralléliser les trois boucles imbriquées. */
+#pragma omp parallel for collapse(3) schedule(static)
+    for (int c = 0; c < C_; ++c)
         for (int y = 0; y < H_; ++y)
-            for (int x = 0; x < W_; ++x) {
-                float best = -1e9f; int best_i = 0;
+            for (int x = 0; x < W_; ++x)
+            {
+                float best   = -1e9f;
+                int   best_i = 0;
+
+                /* balayage 2 × 2 */
                 for (int py = 0; py < 2; ++py)
                     for (int px = 0; px < 2; ++px) {
-                        int iy = y * 2 + py, ix = x * 2 + px;
+                        int iy = y * 2 + py,
+                            ix = x * 2 + px;
                         int i = idx(c, iy, ix, C_, IMG_SIZE, IMG_SIZE);
                         if (in[i] > best) { best = in[i]; best_i = i; }
                     }
-                out[idx(c, y, x, C_, H_, W_)] = best;
-                argmax_.push_back(best_i);
+
+                std::size_t out_idx = idx(c, y, x, C_, H_, W_);
+                out[out_idx]   = best;
+                argmax_[out_idx] = best_i;          // accès unique, thread-safe
             }
+
     return out;
 }
 
-Tensor MaxPool::backward(const Tensor& g) {
+
+Tensor MaxPool::backward(const Tensor& g)              /* PARALLEL_CANDIDATE_OpenMP */
+{
     Tensor dx(C_ * IMG_SIZE * IMG_SIZE, 0.f);
-    for (size_t i = 0; i < argmax_.size(); ++i) dx[argmax_[i]] = g[i];
+    for (std::size_t i = 0; i < argmax_.size(); ++i)
+        dx[argmax_[i]] = g[i];
     return dx;
 }
 
@@ -135,39 +175,48 @@ Dense::Dense(int inD, int outD, std::mt19937& g)
     : inD_(inD), outD_(outD)
 {
     std::uniform_real_distribution<float> D(-0.05f, 0.05f);
-    W_.resize(inD_ * outD_); for (float& w : W_) w = D(g);
+    W_.resize(inD_ * outD_);
+    for (float& w : W_) w = D(g);
     b_.resize(outD_);
 
     dW_.resize(W_.size()); db_.resize(b_.size());
     gW_.assign(W_.size(), 0.f); gb_.assign(b_.size(), 0.f);
 }
 
-Tensor Dense::forward(const Tensor& in) {
+/* ---------- forward (parallélisé) ---------- */
+Tensor Dense::forward(const Tensor& in)
+{
     cache_ = in;
     Tensor y(outD_);
-    for (int o = 0; o < outD_; ++o) {                       /* PARALLEL_CANDIDATE_OpenMP */
+
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < outD_; ++o) {
         float s = b_[o];
-        for (int i = 0; i < inD_; ++i) s += in[i] * W_[o * inD_ + i];
+        for (int i = 0; i < inD_; ++i)
+            s += in[i] * W_[o * inD_ + i];
         y[o] = s;
     }
     return y;
 }
 
-Tensor Dense::backward(const Tensor& g) {                  // ← plus de lr
+/* ---------- backward (séquentiel) ---------- */
+Tensor Dense::backward(const Tensor& g)                /* PARALLEL_CANDIDATE_OpenMP */
+{
     std::fill(dW_.begin(), dW_.end(), 0.f);
     std::fill(db_.begin(), db_.end(), 0.f);
     Tensor dx(inD_, 0.f);
 
-    for (int o = 0; o < outD_; ++o) {                       /* PARALLEL_CANDIDATE_OpenMP */
+    for (int o = 0; o < outD_; ++o) {                   /* PARALLEL_CANDIDATE_OpenMP */
         db_[o] += g[o];
         for (int i = 0; i < inD_; ++i) {
             dW_[o * inD_ + i] += cache_[i] * g[o];
             dx[i] += W_[o * inD_ + i] * g[o];
         }
     }
-    /* cumul du mini-lot */
-    std::transform(gW_.begin(), gW_.end(), dW_.begin(), gW_.begin(), std::plus<float>());
-    std::transform(gb_.begin(), gb_.end(), db_.begin(), gb_.begin(), std::plus<float>());
+    std::transform(gW_.begin(), gW_.end(), dW_.begin(),
+                   gW_.begin(), std::plus<float>());
+    std::transform(gb_.begin(), gb_.end(), db_.begin(),
+                   gb_.begin(), std::plus<float>());
     return dx;
 }
 
