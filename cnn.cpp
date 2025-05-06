@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-/* ───────── constructor ───────── */
+/* ───────── constructor du modele ───────── */
 CNN::CNN(float lr, std::mt19937& g)
     : conv_(1, 8, 3, g),
       relu_{},
